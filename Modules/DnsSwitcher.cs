@@ -1,8 +1,9 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Net.NetworkInformation;
 using System.Linq;
+using System.Management;
+using System.Net;
+using System.Net.NetworkInformation;
 
 namespace SekuraNetweaver.Modules;
 
@@ -16,10 +17,11 @@ public class DnsSwitcher
         { "Original",   Array.Empty<string>() },
     };
 
-    // Stores original config per interface: servers + whether it was DHCP
+    // Stores the original DNS config per adapter SettingID (GUID).
+    // Using SettingID ties us to WMI, which is locale-independent.
     private record DnsConfig(string[] Servers, bool IsDhcp);
-
     private readonly Dictionary<string, DnsConfig> _originalDns = new();
+
     public string CurrentProvider { get; private set; } = "Unknown";
 
     public DnsSwitcher()
@@ -32,15 +34,12 @@ public class DnsSwitcher
     {
         if (!Providers.ContainsKey(providerName)) return;
 
-        var allNics = GetAllGatewayInterfaces();
-        if (!allNics.Any()) return;
-
-        foreach (var iface in allNics)
+        foreach (var adapter in GetActiveAdapters())
         {
             if (providerName == "Original")
-                RestoreOriginalDns(iface);
+                RestoreOriginalDns(adapter.settingId);
             else if (Providers.TryGetValue(providerName, out var servers))
-                SetDnsServers(iface, servers);
+                SetDnsServersWmi(adapter.settingId, servers);
         }
 
         CurrentProvider = providerName;
@@ -48,101 +47,88 @@ public class DnsSwitcher
 
     private void CacheAllOriginalDns()
     {
-        foreach (var iface in GetAllGatewayInterfaces())
+        foreach (var adapter in GetActiveAdapters())
         {
-            var (servers, isDhcp) = GetCurrentDnsConfig(iface);
-            _originalDns[iface] = new DnsConfig(servers, isDhcp);
+            var config = ReadDnsConfig(adapter.settingId);
+            _originalDns[adapter.settingId] = config;
         }
     }
 
-    private void RestoreOriginalDns(string iface)
+    private void RestoreOriginalDns(string settingId)
     {
-        if (!_originalDns.TryGetValue(iface, out var config)) return;
+        if (!_originalDns.TryGetValue(settingId, out var config)) return;
 
         if (config.IsDhcp)
         {
-            // Restore to DHCP - requires setting source=dhcp, not source=static
-            RunNetsh($"interface ip set dns name=\"{iface}\" source=dhcp");
+            // Passing null/empty to SetDNSServerSearchOrder restores DHCP-assigned DNS
+            SetDnsServersWmi(settingId, null);
         }
         else
         {
-            SetDnsServers(iface, config.Servers);
+            SetDnsServersWmi(settingId, config.Servers);
         }
     }
 
     /// <summary>
-    /// Parses netsh output to extract DNS servers and whether they're DHCP-assigned.
-    /// netsh output format:
-    ///   "    DNS servers configured through DHCP:  192.168.1.1"
-    ///   "    Statically Configured DNS Servers:    8.8.8.8"
-    ///   "                                          8.8.4.4"   (continuation)
+    /// Reads current DNS config using the .NET NetworkInterface API.
+    /// Locale-independent — no netsh string parsing.
     /// </summary>
-    private (string[] servers, bool isDhcp) GetCurrentDnsConfig(string iface)
+    private static DnsConfig ReadDnsConfig(string settingId)
     {
-        var output = RunNetshOutput($"interface ip show dns name=\"{iface}\"");
-        var servers = new List<string>();
-        bool isDhcp = false;
-        bool capturing = false;
+        var nic = NetworkInterface.GetAllNetworkInterfaces()
+            .FirstOrDefault(n => string.Equals(n.Id, settingId, StringComparison.OrdinalIgnoreCase));
 
-        foreach (var line in output.Split('\n'))
+        if (nic == null) return new DnsConfig(Array.Empty<string>(), false);
+
+        var props = nic.GetIPProperties();
+        var servers = props.DnsAddresses
+            .Where(a => a.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+            .Select(a => a.ToString())
+            .ToArray();
+
+        // Determine DHCP via WMI — NetworkInterface doesn't expose this directly
+        bool isDhcp = IsDhcpEnabled(settingId);
+
+        return new DnsConfig(servers, isDhcp);
+    }
+
+    private static bool IsDhcpEnabled(string settingId)
+    {
+        try
         {
-            var trimmed = line.Trim();
-
-            if (trimmed.StartsWith("DNS servers configured through DHCP", StringComparison.OrdinalIgnoreCase))
-            {
-                isDhcp = true;
-                capturing = true;
-                var ip = ExtractIpFromConfigLine(trimmed);
-                if (ip != null) servers.Add(ip);
-                continue;
-            }
-
-            if (trimmed.StartsWith("Statically Configured DNS Servers", StringComparison.OrdinalIgnoreCase))
-            {
-                isDhcp = false;
-                capturing = true;
-                var ip = ExtractIpFromConfigLine(trimmed);
-                if (ip != null) servers.Add(ip);
-                continue;
-            }
-
-            // Continuation lines: pure IP addresses on their own
-            if (capturing && IsValidIpAddress(trimmed))
-            {
-                servers.Add(trimmed);
-                continue;
-            }
-
-            // Any other non-empty line ends the server block
-            if (capturing && !string.IsNullOrWhiteSpace(trimmed))
-                capturing = false;
+            using var searcher = new ManagementObjectSearcher(
+                $"SELECT DHCPEnabled FROM Win32_NetworkAdapterConfiguration WHERE SettingID = '{settingId}'");
+            foreach (ManagementObject obj in searcher.Get())
+                return (bool)(obj["DHCPEnabled"] ?? false);
         }
-
-        return (servers.ToArray(), isDhcp);
+        catch { }
+        return false;
     }
 
-    private static string? ExtractIpFromConfigLine(string line)
+    /// <summary>
+    /// Sets DNS servers via WMI Win32_NetworkAdapterConfiguration.
+    /// Faster and more reliable than netsh — no process spawn, no string parsing,
+    /// no locale dependency.
+    /// Pass null or empty array to restore DHCP-assigned DNS.
+    /// </summary>
+    private static void SetDnsServersWmi(string settingId, string[]? servers)
     {
-        // Lines look like: "DNS servers configured through DHCP:  192.168.1.1"
-        var colonIdx = line.LastIndexOf(':');
-        if (colonIdx < 0) return null;
-        var candidate = line[(colonIdx + 1)..].Trim();
-        return IsValidIpAddress(candidate) ? candidate : null;
-    }
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                $"SELECT * FROM Win32_NetworkAdapterConfiguration WHERE SettingID = '{settingId}'");
 
-    private static bool IsValidIpAddress(string s)
-    {
-        return System.Net.IPAddress.TryParse(s, out _);
-    }
+            foreach (ManagementObject obj in searcher.Get())
+            {
+                // null or empty array = let DHCP manage DNS
+                var param = (servers == null || servers.Length == 0)
+                    ? null
+                    : servers;
 
-    private void SetDnsServers(string iface, string[] servers)
-    {
-        if (servers.Length == 0) return;
-
-        RunNetsh($"interface ip set dns name=\"{iface}\" source=static address={servers[0]}");
-
-        for (int i = 1; i < servers.Length; i++)
-            RunNetsh($"interface ip add dns name=\"{iface}\" {servers[i]} index={i + 1}");
+                obj.InvokeMethod("SetDNSServerSearchOrder", new object?[] { param });
+            }
+        }
+        catch { }
     }
 
     public bool IsDoHEnabled()
@@ -158,74 +144,30 @@ public class DnsSwitcher
 
     private string DetectCurrentProvider()
     {
-        var iface = GetPrimaryInterface();
-        if (iface == null) return "Unknown";
+        var primary = GetActiveAdapters().FirstOrDefault();
+        if (primary == default) return "Unknown";
 
-        var (servers, _) = GetCurrentDnsConfig(iface);
+        var config = ReadDnsConfig(primary.settingId);
         foreach (var kvp in Providers)
         {
-            if (kvp.Value.Intersect(servers).Any())
+            if (kvp.Value.Intersect(config.Servers).Any())
                 return kvp.Key;
         }
         return "Custom/Original";
     }
 
-    private static string? GetPrimaryInterface()
+    /// <summary>
+    /// Returns (name, settingId) for all active non-loopback adapters with a gateway.
+    /// SettingID is the adapter GUID — the stable cross-API identifier that maps
+    /// NetworkInterface to Win32_NetworkAdapterConfiguration.
+    /// </summary>
+    private static List<(string name, string settingId)> GetActiveAdapters()
     {
         return NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up
                      && n.NetworkInterfaceType != NetworkInterfaceType.Loopback
                      && n.GetIPProperties().GatewayAddresses.Count > 0)
-            .Select(n => n.Name)
-            .FirstOrDefault();
-    }
-
-    private static List<string> GetAllGatewayInterfaces()
-    {
-        return NetworkInterface.GetAllNetworkInterfaces()
-            .Where(n => n.OperationalStatus == OperationalStatus.Up
-                     && n.NetworkInterfaceType != NetworkInterfaceType.Loopback
-                     && n.GetIPProperties().GatewayAddresses.Count > 0)
-            .Select(n => n.Name)
+            .Select(n => (n.Name, n.Id))
             .ToList();
-    }
-
-    // The app manifest requests admin elevation (requiresAdministrator), so netsh
-    // runs in the existing elevated context. No Verb = "runas" needed — that would
-    // spawn a second UAC prompt on top of the one the user already accepted.
-    private static void RunNetsh(string args)
-    {
-        try
-        {
-            var psi = new ProcessStartInfo("netsh", args)
-            {
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden,
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-            };
-            var proc = Process.Start(psi);
-            proc?.WaitForExit(5000);
-        }
-        catch { }
-    }
-
-    private static string RunNetshOutput(string args)
-    {
-        try
-        {
-            var psi = new ProcessStartInfo("netsh", args)
-            {
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            var proc = Process.Start(psi);
-            var output = proc?.StandardOutput.ReadToEnd() ?? "";
-            proc?.WaitForExit(5000);
-            return output;
-        }
-        catch { return string.Empty; }
     }
 }

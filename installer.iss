@@ -4,7 +4,7 @@
 [Setup]
 AppId={{D3B2A1E5-8C9B-4D3A-9F1E-7C2B5A4D3E1F}
 AppName=Sekura Netweaver
-AppVersion=1.4.1
+AppVersion=1.4.2
 AppPublisher=SekuraGuard
 DefaultDirName={autopf}\Sekura Netweaver
 DefaultGroupName=Sekura Netweaver

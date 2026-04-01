@@ -24,7 +24,7 @@ public class AboutForm : Form
 
         var titleLabel = new Label
         {
-            Text = "SekuraNetweaver v1.3.0",
+            Text = "SekuraNetweaver v1.4.2",
             Font = new Font("Segoe UI", 16, FontStyle.Bold),
             Location = new Point(20, 20),
             AutoSize = true,
