@@ -14,10 +14,9 @@ Unlike standard diagnostic tools, SekuraNetweaver implements a **"Trust Pipeline
 - **PS Script Auditing**: Specifically identifies and reports the exact `.ps1` or `.psm1` file being executed by PowerShell instances.
 
 ### 2. Privacy-First DNS Switching
-One-click toggling between high-performance, privacy-respecting DNS providers.
-- **Predefined Profiles**: Cloudflare, Quad9, and Google.
-- **Safety**: Automatically caches original network adapter settings for seamless one-click rollback.
-- **Win11 Support**: Includes registry-level checks for DNS-over-HTTPS (DoH) policy compliance.
+One-click toggling between high-performance, privacy-respecting DNS providers. Automatically caches and restores original network settings.
+- **Integrated Log Management**: Directly access and **clear** persistent logs from the tray menu to keep your system clean.
+- **No Telemetry**: Your logs and whitelists stay on your machine. SekuraNetweaver is 100% local-only.
 
 ### 3. Smart WiFi Auditing
 Real-time analysis of wireless security properties using the Native Wifi API.

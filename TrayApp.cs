@@ -104,6 +104,10 @@ public class TrayApp : ApplicationContext
         logsItem.Click += (s, e) => OpenLogs();
         menu.Items.Add(logsItem);
 
+        var clearLogsItem = new ToolStripMenuItem("Clear Logs");
+        clearLogsItem.Click += (s, e) => ClearLogs();
+        menu.Items.Add(clearLogsItem);
+
         menu.Items.Add(new ToolStripSeparator());
 
         // --- About ---
@@ -163,6 +167,32 @@ public class TrayApp : ApplicationContext
             Process.Start(new ProcessStartInfo("notepad.exe", logPath) { UseShellExecute = true });
         } catch {
             // Fallback
+        }
+    }
+
+    private void ClearLogs()
+    {
+        string appDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SekuraNetweaver");
+        string logPath = Path.Combine(appDataPath, "alerts.log");
+
+        var result = MessageBox.Show(
+            "Are you sure you want to clear logs? You won't be able to retrieve them.",
+            "Confirm Clear",
+            MessageBoxButtons.YesNo,
+            MessageBoxIcon.Question
+        );
+
+        if (result == DialogResult.Yes)
+        {
+            try
+            {
+                File.WriteAllText(logPath, string.Empty);
+                _tray.ShowBalloonTip(2000, "SekuraNetweaver", "Logs cleared successfully.", ToolTipIcon.Info);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Error clearing logs: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
     }
 

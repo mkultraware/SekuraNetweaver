@@ -4,7 +4,7 @@
 [Setup]
 AppId={{D3B2A1E5-8C9B-4D3A-9F1E-7C2B5A4D3E1F}
 AppName=Sekura Netweaver
-AppVersion=1.3.1
+AppVersion=1.3.2
 AppPublisher=SekuraGuard
 DefaultDirName={autopf}\Sekura Netweaver
 DefaultGroupName=Sekura Netweaver
@@ -32,7 +32,6 @@ Source: "bin\Release\net8.0-windows10.0.19041.0\win-x64\publish\*"; DestDir: "{a
 ; Include the icon for shortcuts
 Source: "Assets\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 ; Documentation
-Source: "TECHNICAL_DOCUMENTATION.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

@@ -94,10 +94,11 @@ public class ProcessMonitor
         "nvcontainer", "nvdisplay.container", "nvcplui", "nvidia container", "nvtelemetry",
         "amftelemetry", "roaming", "igfxtray",
         
-        // Windows services/UI
+        // Windows services/UI & Core Utilities
         "wuauclt", "MsMpEng", "conhost", "mpdefendercoreservice",
         "taskhostw", "searchui", "mobsynccmanager", "securityhealthservice",
         "OneDriveStandaloneUpdater", "GoogleUpdate", "searchhost", "runtimebroker", "sgrmbroker", "fontdrvhost",
+        "systemsettings", "compattelrunner", "ctfmon", "smartscreen", "browser_broker",
         "powershell: UnknownScript"
     };
 
@@ -105,11 +106,12 @@ public class ProcessMonitor
     {
         "microsoft.com", "windows.com", "windowsupdate.com", "live.com", "office.com",
         "google.com", "googleapis.com", "google-analytics.com", "1e100.net", "googleusercontent.com",
-        "cloudflare.com", "akamai.net", "fastly.net",
+        "cloudflare.com", "akamai.net", "fastly.net", "akamaitechnologies.com",
         "github.com", "githubusercontent.com",
         "apple.com", "icloud.com",
         "dropbox.com", "spotify.com", "discord.com", "slack.com",
-        "azure.com", "azure.net", "visualstudio.com", "msedge.net"
+        "azure.com", "azure.net", "visualstudio.com", "msedge.net",
+        "ea.com", "origin.com", "ubisoft.com", "ubi.com", "awsglobalaccelerator.com", "microsoftonline.com"
     };
     
     private static readonly HashSet<string> TrustedPublishers = new(StringComparer.OrdinalIgnoreCase)
@@ -262,8 +264,8 @@ public class ProcessMonitor
                     if (process == null) continue;
 
                     var name = process.ProcessName.ToLowerInvariant();
-                    var fullPath = string.Empty;
-                    try { fullPath = process.MainModule?.FileName; } catch { }
+                    string fullPath = string.Empty;
+                    try { fullPath = process.MainModule?.FileName ?? string.Empty; } catch { }
 
                     // Specific check for PowerShell scripts
                     if (name == "powershell" || name == "pwsh")
@@ -299,7 +301,10 @@ public class ProcessMonitor
                     {
                         if (StaticWhitelist.Contains(name) || DynamicWhitelist.Contains(name)) continue;
                         if (isSafeDomain) continue;
-                        if (isTrustedPublisher && (remotePort == 80 || remotePort == 443)) continue;
+                        
+                        // Generalized Fix: If publisher is trusted and path is standard, allow ALL ports
+                        // This accounts for subprocesses and gaming ports (9000, 8095, etc.) for Microsoft, EA, Valve, etc.
+                        if (isTrustedPublisher) continue;
                     }
 
                     var key = $"{name}:{remoteIp}:{remotePort}:{protocol}";
