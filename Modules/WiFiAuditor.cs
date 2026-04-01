@@ -11,29 +11,34 @@ public class WifiAuditor
     {
         try
         {
+            // EnumerateAvailableNetworks gives us actual security info (auth + cipher).
+            // EnumerateBssNetworks only gives PhyType (802.11a/b/g/n/ac/ax) which is
+            // the radio standard, NOT the encryption standard. The two are unrelated.
+            var connectedNetworks = NativeWifi.EnumerateAvailableNetworks()
+                .Where(n => n.IsConnected)
+                .ToList();
+
+            if (connectedNetworks.Any())
+            {
+                var network = connectedNetworks.First();
+                var ssid = network.Ssid.ToString();
+                var secLabel = GetSecurityLabel(network.AuthAlgorithm, network.CipherAlgorithm);
+                var indicator = IsNetworkSafe(network.AuthAlgorithm, network.CipherAlgorithm) ? "✅" : "⚠️";
+                return $"{ssid} · {secLabel} {indicator}";
+            }
+
+            // Not on WiFi - fall back to NIC type
             var primaryNic = GetPrimaryInterface();
             if (primaryNic != null)
             {
-                var ssids = NativeWifi.EnumerateConnectedNetworkSsids();
-                var ssid = ssids.FirstOrDefault()?.ToString();
-                
-                if (!string.IsNullOrEmpty(ssid))
-                {
-                    var auth = GetAuthType(ssid);
-                    var secure = IsNetworkSafe(ssid) ? "✅" : "⚠️";
-                    return $"WiFi: {ssid} · {auth} {secure}";
-                }
-                
-                var nicType = primaryNic.NetworkInterfaceType switch
+                return primaryNic.NetworkInterfaceType switch
                 {
                     NetworkInterfaceType.Ethernet => "Ethernet Active ✅",
-                    NetworkInterfaceType.Wireless80211 => "WiFi Active",
                     NetworkInterfaceType.Ppp => "VPN Active",
-                    _ => $"{primaryNic.Name}"
+                    _ => primaryNic.Name
                 };
-                return nicType;
             }
-            
+
             return "Not connected";
         }
         catch
@@ -42,53 +47,56 @@ public class WifiAuditor
         }
     }
 
-    private static bool IsNetworkSafe(string ssid)
+    /// <summary>
+    /// Returns a human-readable security label derived from actual auth and cipher algorithms.
+    /// </summary>
+    private static string GetSecurityLabel(AuthAlgorithm auth, CipherAlgorithm cipher)
     {
-        try
-        {
-            var bssNetworks = NativeWifi.EnumerateBssNetworks();
-            foreach (var bss in bssNetworks)
-            {
-                if (bss.Ssid.ToString() != ssid) continue;
+        // Open network - no encryption
+        if (auth == AuthAlgorithm.Open && cipher == CipherAlgorithm.None)
+            return "Open ⚠️";
 
-                var phy = bss.PhyType.ToString();
-                // Modern standards = safe
-                if (phy.Contains("Ac") || phy.Contains("Ax") || phy.Contains("6") || phy.Contains("7"))
-                    return true;
-                
-                // N = safe if not ancient
-                if (phy.Contains("N"))
-                    return true;
-                    
-                return false;
-            }
-        }
-        catch { }
-        return false;
+        // WEP - deprecated, broken
+        if (cipher is CipherAlgorithm.Wep40 or CipherAlgorithm.Wep104 or CipherAlgorithm.Wep)
+            return "WEP ⚠️";
+
+        // WPA3
+        if (auth is AuthAlgorithm.Wpa3Sae or AuthAlgorithm.Wpa3)
+            return "WPA3";
+
+        // OWE (Opportunistic Wireless Encryption - open but encrypted)
+        if (auth == AuthAlgorithm.Owe)
+            return "OWE";
+
+        // WPA2 - RSNA with CCMP/AES
+        if (auth is AuthAlgorithm.Rsna or AuthAlgorithm.RsnaPsk)
+            return cipher == CipherAlgorithm.Ccmp ? "WPA2" : "WPA2 (weak cipher)";
+
+        // WPA - legacy
+        if (auth is AuthAlgorithm.Wpa or AuthAlgorithm.WpaPsk)
+            return "WPA ⚠️";
+
+        // Unknown or vendor-specific
+        return $"{auth}";
     }
 
-    private static string GetAuthType(string ssid)
+    /// <summary>
+    /// Returns true if the network uses a currently acceptable encryption standard.
+    /// WEP, open, and legacy WPA are considered unsafe.
+    /// </summary>
+    private static bool IsNetworkSafe(AuthAlgorithm auth, CipherAlgorithm cipher)
     {
-        try
-        {
-            var bssNetworks = NativeWifi.EnumerateBssNetworks();
-            foreach (var bss in bssNetworks)
-            {
-                if (bss.Ssid.ToString() != ssid) continue;
+        // Open with no encryption
+        if (auth == AuthAlgorithm.Open && cipher == CipherAlgorithm.None) return false;
 
-                var phy = bss.PhyType.ToString();
-                return phy switch
-                {
-                    var t when t.Contains("Ac") || t.Contains("Ax") => "WPA2/WPA3",
-                    var t when t.Contains("N")   => "WPA2",
-                    var t when t.Contains("G")   => "WPA/WEP ⚠️",
-                    var t when t.Contains("6") || t.Contains("7") => "WiFi 6/7",
-                    _                            => phy
-                };
-            }
-        }
-        catch { }
-        return "Unknown";
+        // WEP is cryptographically broken
+        if (cipher is CipherAlgorithm.Wep40 or CipherAlgorithm.Wep104 or CipherAlgorithm.Wep) return false;
+
+        // WPA (TKIP) - deprecated, crackable
+        if (auth is AuthAlgorithm.Wpa or AuthAlgorithm.WpaPsk) return false;
+
+        // WPA2 or better with AES-CCMP or stronger = safe
+        return true;
     }
 
     private static NetworkInterface? GetPrimaryInterface()
@@ -101,4 +109,3 @@ public class WifiAuditor
             .FirstOrDefault();
     }
 }
-

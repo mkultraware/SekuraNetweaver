@@ -4,9 +4,8 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
-using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -18,19 +17,27 @@ public class ProcessMonitor
 
     private Thread? _thread;
     private bool _running;
-    private readonly Dictionary<string, DateTime> _alerted = new();  
+    // Only touched from monitor thread - no lock needed
+    private readonly Dictionary<string, DateTime> _alerted = new();
+    private DateTime _lastAlertedCleanup = DateTime.MinValue;
     private readonly ConcurrentDictionary<string, (string host, DateTime expiry)> _dnsCache = new();
     private DateTime _lastDnsCleanup = DateTime.MinValue;
     private readonly string _powershellPath = "powershell.exe";
     private volatile bool _enabled = true;
-    public bool Enabled 
-    { 
-        get => _enabled; 
-        set => _enabled = value; 
+
+    public bool Enabled
+    {
+        get => _enabled;
+        set => _enabled = value;
     }
 
-    private static readonly string whitelistPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SekuraNetweaver", "user-whitelist.txt");
-    private static readonly string logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SekuraNetweaver", "alerts.log");
+    private static readonly string whitelistPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "SekuraNetweaver", "user-whitelist.txt");
+
+    private static readonly string logPath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "SekuraNetweaver", "alerts.log");
 
     static ProcessMonitor()
     {
@@ -54,7 +61,7 @@ public class ProcessMonitor
             };
             watcher.Changed += (s, e) => LoadDynamicWhitelists();
             watcher.Created += (s, e) => LoadDynamicWhitelists();
-            watcher.Deleted += (s, e) => { _dynamicWhitelist.Clear(); };
+            watcher.Deleted += (s, e) => { _dynamicWhitelist = new HashSet<string>(StringComparer.OrdinalIgnoreCase); };
             watcher.EnableRaisingEvents = true;
         }
         catch { }
@@ -65,55 +72,54 @@ public class ProcessMonitor
         // Core Windows
         "svchost", "lsass", "wininit", "services", "explorer",
         "dwm", "csrss", "smss", "winlogon", "spoolsv",
-        
+
         // Browsers & Communication
-        "msedge", "chrome", "firefox", "brave", "opera", "safari",
+        "msedge", "chrome", "firefox", "brave", "opera",
         "onedrive", "teams", "slack", "discord", "zoom", "skype", "whatsapp",
-        
-        // Gaming & Launchers (expanded)
-        "steam", "steamwebhelper", "steamservice", "epicgameslauncher", "origin", "eacore", "eaconsole",
-        "uplay", "ubicommunication", "battlenet", "agent", "RiotClientServices", "LeagueClientUx",
-        "r5apex", "battleeye", "beservice", "easyanticheat", "ac_server", "rtss", "msi_afterburner",
-        "obs64", "obs", "streamlabs obs", "xsplit", "eadesktop", "ealauncher",
-        
+
+        // Gaming & Launchers
+        "steam", "steamwebhelper", "steamservice", "epicgameslauncher", "origin", "eacore",
+        "uplay", "ubicommunication", "battlenet", "agent", "riotclientservices", "leagueclientux",
+        "r5apex", "battleeye", "beservice", "easyanticheat", "rtss", "msi_afterburner",
+        "obs64", "obs", "xsplit", "eadesktop", "ealauncher",
+
         // Anti-Cheat & Game Services
-        "vgk", "vgc", "beservice", "beserver", "ac_server", "easyanticheat", "battleye", 
-        "kernel32", "winhttp", "wininet",
-        
+        "vgk", "vgc",
+
         // Dev & IDE
-        "code", "msbuild", "dotnet", "devenv", "rider64", "visualstudio",
-        "language_server_windows_x64", "language_server_windows_x86",
-        
-        // Assistant
-        "antigravity",
-        
+        "code", "msbuild", "dotnet", "devenv", "rider64",
+
         // VPN
         "protonvpn.wireguardservice", "protonvpn.client",
-        
+
         // NVIDIA/AMD/Intel
-        "nvcontainer", "nvdisplay.container", "nvcplui", "nvidia container", "nvtelemetry",
-        "amftelemetry", "roaming", "igfxtray",
-        
-        // Windows services/UI & Core Utilities
-        "wuauclt", "MsMpEng", "conhost", "mpdefendercoreservice",
-        "taskhostw", "searchui", "mobsynccmanager", "securityhealthservice",
-        "OneDriveStandaloneUpdater", "GoogleUpdate", "searchhost", "runtimebroker", "sgrmbroker", "fontdrvhost",
-        "systemsettings", "compattelrunner", "ctfmon", "smartscreen", "browser_broker",
-        "powershell: UnknownScript"
+        "nvcontainer", "nvdisplay.container", "nvcplui", "nvtelemetry",
+        "amftelemetry", "igfxtray",
+
+        // Windows services & Core Utilities
+        "wuauclt", "msmpeng", "conhost", "mpdefendercoreservice",
+        "taskhostw", "searchui", "securityhealthservice",
+        "onedrivestantaloneupdater", "googleupdate", "searchhost",
+        "runtimebroker", "sgrmbroker", "fontdrvhost", "systemsettings",
+        "compattelrunner", "ctfmon", "smartscreen", "browser_broker",
+
+        // Known good PS scripts
+        "powershell: unknownscript"
     };
 
     private static readonly HashSet<string> SafeDomains = new(StringComparer.OrdinalIgnoreCase)
     {
         "microsoft.com", "windows.com", "windowsupdate.com", "live.com", "office.com",
-        "google.com", "googleapis.com", "google-analytics.com", "1e100.net", "googleusercontent.com",
+        "google.com", "googleapis.com", "1e100.net", "googleusercontent.com",
         "cloudflare.com", "akamai.net", "fastly.net", "akamaitechnologies.com",
         "github.com", "githubusercontent.com",
         "apple.com", "icloud.com",
         "dropbox.com", "spotify.com", "discord.com", "slack.com",
         "azure.com", "azure.net", "visualstudio.com", "msedge.net",
-        "ea.com", "origin.com", "ubisoft.com", "ubi.com", "awsglobalaccelerator.com", "microsoftonline.com"
+        "ea.com", "origin.com", "ubisoft.com", "ubi.com",
+        "awsglobalaccelerator.com", "microsoftonline.com"
     };
-    
+
     private static readonly HashSet<string> TrustedPublishers = new(StringComparer.OrdinalIgnoreCase)
     {
         "Microsoft Corporation",
@@ -128,39 +134,15 @@ public class ProcessMonitor
         "Intel Corporation"
     };
 
-    private static HashSet<string> _dynamicSafeDomains = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly string domainWhitelistPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "user-domains.txt");
+    // volatile ensures the reference replacement from FileSystemWatcher thread is immediately visible
+    // to the monitor thread. The HashSet itself is replaced wholesale, never mutated in place.
+    private static volatile HashSet<string> _dynamicWhitelist = new(StringComparer.OrdinalIgnoreCase);
+    private static volatile HashSet<string> _dynamicSafeDomains = new(StringComparer.OrdinalIgnoreCase);
 
-    private static HashSet<string> _dynamicWhitelist = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly string domainWhitelistPath = Path.Combine(
+        AppDomain.CurrentDomain.BaseDirectory, "user-domains.txt");
+
     public static HashSet<string> DynamicWhitelist => _dynamicWhitelist;
-
-    private static void LoadDynamicWhitelist()
-    {
-        try
-        {
-            if (File.Exists(whitelistPath))
-            {
-                var newWhitelist = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var line in File.ReadAllLines(whitelistPath))
-                {
-                    var trimmed = line.Trim();
-                    if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("#"))
-                    {
-                        newWhitelist.Add(trimmed);
-                    }
-                }
-                _dynamicWhitelist = newWhitelist;
-            }
-        }
-        catch { }
-    }
-
-    public static void AddToWhitelist(string processName, string ip = "")
-    {
-        _dynamicWhitelist.Add(processName);
-        File.AppendAllLines(whitelistPath, new[] { processName });
-        LogAlert($"WHITELISTED: {processName} {(string.IsNullOrEmpty(ip) ? "" : $"(IP: {ip})")}");
-    }
 
     private static void LoadDynamicWhitelists()
     {
@@ -168,29 +150,57 @@ public class ProcessMonitor
         LoadDynamicSafeDomains();
     }
 
+    private static void LoadDynamicWhitelist()
+    {
+        try
+        {
+            if (!File.Exists(whitelistPath)) return;
+
+            var newWhitelist = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var line in File.ReadAllLines(whitelistPath))
+            {
+                var trimmed = line.Trim();
+                if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("#"))
+                    newWhitelist.Add(trimmed);
+            }
+            _dynamicWhitelist = newWhitelist;
+        }
+        catch { }
+    }
+
     private static void LoadDynamicSafeDomains()
     {
         try
         {
-            if (File.Exists(domainWhitelistPath))
+            if (!File.Exists(domainWhitelistPath)) return;
+
+            var newDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var line in File.ReadAllLines(domainWhitelistPath))
             {
-                var newDomains = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var line in File.ReadAllLines(domainWhitelistPath))
-                {
-                    var trimmed = line.Trim();
-                    if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("#"))
-                        newDomains.Add(trimmed);
-                }
-                _dynamicSafeDomains = newDomains;
+                var trimmed = line.Trim();
+                if (!string.IsNullOrEmpty(trimmed) && !trimmed.StartsWith("#"))
+                    newDomains.Add(trimmed);
             }
+            _dynamicSafeDomains = newDomains;
         }
         catch { }
+    }
+
+    public static void AddToWhitelist(string processName, string ip = "")
+    {
+        var current = _dynamicWhitelist;
+        var updated = new HashSet<string>(current, StringComparer.OrdinalIgnoreCase) { processName };
+        _dynamicWhitelist = updated;
+        File.AppendAllLines(whitelistPath, new[] { processName });
+        LogAlert($"WHITELISTED: {processName} {(string.IsNullOrEmpty(ip) ? "" : $"(IP: {ip})")}");
     }
 
     public static void TrustDomain(string domain)
     {
         if (string.IsNullOrEmpty(domain)) return;
-        _dynamicSafeDomains.Add(domain);
+        var current = _dynamicSafeDomains;
+        var updated = new HashSet<string>(current, StringComparer.OrdinalIgnoreCase) { domain };
+        _dynamicSafeDomains = updated;
         File.AppendAllLines(domainWhitelistPath, new[] { domain });
         LogAlert($"TRUSTED DOMAIN: {domain}");
     }
@@ -202,18 +212,78 @@ public class ProcessMonitor
         {
             var cert = X509Certificate.CreateFromSignedFile(path);
             var subject = cert.Subject;
-            
-            // Extract Common Name (CN) or Organization (O)
             var parts = subject.Split(',').Select(p => p.Trim());
             var cn = parts.FirstOrDefault(p => p.StartsWith("CN=", StringComparison.OrdinalIgnoreCase))?.Substring(3);
             var o = parts.FirstOrDefault(p => p.StartsWith("O=", StringComparison.OrdinalIgnoreCase))?.Substring(2);
-            
             return cn ?? o ?? subject;
         }
         catch
         {
             return string.Empty;
         }
+    }
+
+    // --- P/Invoke: GetExtendedTcpTable ---
+    // Replaces the PowerShell Get-NetTCPConnection approach.
+    // No process spawn overhead, no 5-second latency tax, no EDR false positives.
+
+    private enum TcpTableClass
+    {
+        TcpTableOwnerPidConnections = 4 // Established connections with owning PID
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MibTcpRowOwnerPid
+    {
+        public uint dwState;
+        public uint dwLocalAddr;
+        public uint dwLocalPort;
+        public uint dwRemoteAddr;
+        public uint dwRemotePort;
+        public uint dwOwningPid;
+    }
+
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint GetExtendedTcpTable(
+        IntPtr pTcpTable, ref int dwOutBufLen, bool sort,
+        int ipVersion, TcpTableClass tblClass, uint reserved);
+
+    private static List<(int pid, string ip, int port)> GetActiveConnections()
+    {
+        var results = new List<(int, string, int)>();
+
+        int bufferSize = 0;
+        GetExtendedTcpTable(IntPtr.Zero, ref bufferSize, false, 2 /*AF_INET*/, TcpTableClass.TcpTableOwnerPidConnections, 0);
+
+        var buffer = Marshal.AllocHGlobal(bufferSize);
+        try
+        {
+            uint ret = GetExtendedTcpTable(buffer, ref bufferSize, false, 2, TcpTableClass.TcpTableOwnerPidConnections, 0);
+            if (ret != 0) return results;
+
+            int numEntries = Marshal.ReadInt32(buffer);
+            int rowSize = Marshal.SizeOf<MibTcpRowOwnerPid>();
+            IntPtr rowPtr = buffer + 4; // skip past dwNumEntries
+
+            for (int i = 0; i < numEntries; i++)
+            {
+                var row = Marshal.PtrToStructure<MibTcpRowOwnerPid>(rowPtr + i * rowSize);
+
+                var remoteIp = new IPAddress(BitConverter.GetBytes(row.dwRemoteAddr)).ToString();
+
+                // Port is stored in network byte order in the low 16 bits of the DWORD
+                ushort rawPort = (ushort)(row.dwRemotePort & 0xFFFF);
+                int remotePort = ((rawPort & 0xFF) << 8) | (rawPort >> 8);
+
+                results.Add(((int)row.dwOwningPid, remoteIp, remotePort));
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+
+        return results;
     }
 
     private static readonly List<IPNetwork2> PrivateRanges = new()
@@ -247,17 +317,18 @@ public class ProcessMonitor
                 Thread.Sleep(1000);
                 continue;
             }
+
             try
             {
                 var connections = GetActiveConnections();
+
                 foreach (var conn in connections)
                 {
                     int pid = conn.pid;
                     string remoteIp = conn.ip;
                     int remotePort = conn.port;
-                    string protocol = conn.protocol;
 
-                    if (pid < 500 || pid == -1) continue;
+                    if (pid < 500) continue;
                     if (IsPrivateIp(remoteIp)) continue;
 
                     var process = GetProcess(pid);
@@ -267,17 +338,7 @@ public class ProcessMonitor
                     string fullPath = string.Empty;
                     try { fullPath = process.MainModule?.FileName ?? string.Empty; } catch { }
 
-                    // Specific check for PowerShell scripts
-                    if (name == "powershell" || name == "pwsh")
-                    {
-                        var scriptName = GetPowerShellScript(pid);
-                        if (!string.IsNullOrEmpty(scriptName))
-                        {
-                            name = $"powershell: {scriptName}";
-                        }
-                    }
-
-                    // Security: Check if process is running from suspicious location
+                    // Check path before doing any expensive operations
                     bool isSuspiciousPath = !string.IsNullOrEmpty(fullPath) && (
                         fullPath.Contains("\\Temp\\", StringComparison.OrdinalIgnoreCase) ||
                         fullPath.Contains("\\AppData\\Local\\Temp\\", StringComparison.OrdinalIgnoreCase) ||
@@ -285,51 +346,59 @@ public class ProcessMonitor
                         fullPath.Contains(":\\Windows\\Temp\\", StringComparison.OrdinalIgnoreCase)
                     );
 
-                    // Security: Reverse DNS Lookup with Cache
-                    string hostName = GetHostName(remoteIp);
-                    bool isSafeDomain = IsSafeDomain(hostName);
-                    
-                    // Security: Digital Signature Check
-                    string publisher = GetPublisher(fullPath);
-                    bool isTrustedPublisher = !string.IsNullOrEmpty(publisher) && TrustedPublishers.Any(p => publisher.Contains(p, StringComparison.OrdinalIgnoreCase));
-
-                    // Skip internal traffic (local network, loopback)
-                    if (IsPrivateIp(remoteIp)) continue;
-
-                    // Only skip if path is clean
                     if (!isSuspiciousPath)
                     {
-                        if (StaticWhitelist.Contains(name) || DynamicWhitelist.Contains(name)) continue;
-                        if (isSafeDomain) continue;
-                        
-                        // Generalized Fix: If publisher is trusted and path is standard, allow ALL ports
-                        // This accounts for subprocesses and gaming ports (9000, 8095, etc.) for Microsoft, EA, Valve, etc.
-                        if (isTrustedPublisher) continue;
+                        if (StaticWhitelist.Contains(name) || _dynamicWhitelist.Contains(name)) continue;
                     }
 
-                    var key = $"{name}:{remoteIp}:{remotePort}:{protocol}";
-                    if (_alerted.TryGetValue(key, out var lastAlert) &&
-                        (DateTime.Now - lastAlert).TotalMinutes < 5) 
+                    // Reverse DNS with timeout - only done if process isn't already trusted
+                    string hostName = GetHostName(remoteIp);
+                    bool isSafeDomain = IsSafeDomain(hostName);
+
+                    if (!isSuspiciousPath && isSafeDomain) continue;
+
+                    // Authenticode check - only for non-whitelisted, non-safe-domain connections
+                    string publisher = GetPublisher(fullPath);
+                    bool isTrustedPublisher = !string.IsNullOrEmpty(publisher) &&
+                        TrustedPublishers.Any(p => publisher.Contains(p, StringComparison.OrdinalIgnoreCase));
+
+                    if (!isSuspiciousPath && isTrustedPublisher) continue;
+
+                    // PS script auditing - only when we're already going to alert
+                    if (name == "powershell" || name == "pwsh")
+                    {
+                        var scriptName = GetPowerShellScript(pid);
+                        if (!string.IsNullOrEmpty(scriptName))
+                            name = $"powershell: {scriptName}";
+                    }
+
+                    var alertKey = $"{name}:{remoteIp}:{remotePort}";
+                    if (_alerted.TryGetValue(alertKey, out var lastAlert) &&
+                        (DateTime.Now - lastAlert).TotalMinutes < 5)
                         continue;
 
-                    _alerted[key] = DateTime.Now;
-                    var alertMsg = $"{protocol} {name} → {remoteIp}:{remotePort} {(string.IsNullOrEmpty(hostName) ? "" : $"({hostName})")}";
-                    
-                    if (isSuspiciousPath) alertMsg += " [SUSPICIOUS PATH]";
-                    
-                    LogAlert($"ALERT: {alertMsg}");
-                    bool isUdp = protocol.Equals("UDP", StringComparison.OrdinalIgnoreCase);
-                    OnSuspiciousProcess?.Invoke(name, remoteIp, hostName, isUdp, remotePort, publisher);
+                    _alerted[alertKey] = DateTime.Now;
 
-                    // Log but do not terminate
-                    LogAlert($"DETECTED: {name} ({pid}) - Suspicious {protocol} connection to {remoteIp}:{remotePort} ({hostName})");
+                    var alertMsg = $"TCP {name} → {remoteIp}:{remotePort} {(string.IsNullOrEmpty(hostName) ? "" : $"({hostName})")}";
+                    if (isSuspiciousPath) alertMsg += " [SUSPICIOUS PATH]";
+                    LogAlert($"ALERT: {alertMsg}");
+
+                    OnSuspiciousProcess?.Invoke(name, remoteIp, hostName, false, remotePort, publisher);
                 }
 
-                // Periodic DNS cache cleanup
+                // Periodic cleanups
                 if ((DateTime.Now - _lastDnsCleanup).TotalHours > 1)
                 {
                     CleanupDnsCache();
                     _lastDnsCleanup = DateTime.Now;
+                }
+
+                if ((DateTime.Now - _lastAlertedCleanup).TotalHours > 1)
+                {
+                    var cutoff = DateTime.Now.AddHours(-1);
+                    foreach (var key in _alerted.Where(kvp => kvp.Value < cutoff).Select(kvp => kvp.Key).ToList())
+                        _alerted.Remove(key);
+                    _lastAlertedCleanup = DateTime.Now;
                 }
             }
             catch (Exception ex)
@@ -348,99 +417,53 @@ public class ProcessMonitor
 
         try
         {
-            // Use a short timeout for DNS lookup to avoid blocking the monitor loop
-            var host = Dns.GetHostEntry(ip).HostName;
-            _dnsCache[ip] = (host, DateTime.Now.AddHours(1));
-            return host;
+            // 2-second timeout - blocking Dns.GetHostEntry can stall for much longer
+            var task = Task.Run(() => Dns.GetHostEntry(ip).HostName);
+            if (task.Wait(TimeSpan.FromSeconds(2)))
+            {
+                var host = task.Result;
+                _dnsCache[ip] = (host, DateTime.Now.AddHours(1));
+                return host;
+            }
         }
-        catch
-        {
-            _dnsCache[ip] = (string.Empty, DateTime.Now.AddMinutes(10)); // Cache failure for a bit
-            return string.Empty;
-        }
+        catch { }
+
+        _dnsCache[ip] = (string.Empty, DateTime.Now.AddMinutes(10));
+        return string.Empty;
     }
 
-    private bool IsSafeDomain(string host)
+    private static bool IsSafeDomain(string host)
     {
         if (string.IsNullOrEmpty(host)) return false;
-        
-        bool isSafe = SafeDomains.Any(d => host.Equals(d, StringComparison.OrdinalIgnoreCase) || host.EndsWith("." + d, StringComparison.OrdinalIgnoreCase));
-        if (isSafe) return true;
 
-        return _dynamicSafeDomains.Any(d => host.Equals(d, StringComparison.OrdinalIgnoreCase) || host.EndsWith("." + d, StringComparison.OrdinalIgnoreCase));
+        if (SafeDomains.Any(d => host.Equals(d, StringComparison.OrdinalIgnoreCase) ||
+                                  host.EndsWith("." + d, StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        return _dynamicSafeDomains.Any(d => host.Equals(d, StringComparison.OrdinalIgnoreCase) ||
+                                             host.EndsWith("." + d, StringComparison.OrdinalIgnoreCase));
     }
 
     private void CleanupDnsCache()
     {
         var now = DateTime.Now;
-        var expiredKeys = _dnsCache.Where(kvp => kvp.Value.expiry < now).Select(kvp => kvp.Key).ToList();
-        foreach (var key in expiredKeys)
+        foreach (var key in _dnsCache.Where(kvp => kvp.Value.expiry < now).Select(kvp => kvp.Key).ToList())
             _dnsCache.TryRemove(key, out _);
-    }
-
-    private List<(int pid, string ip, int port, string protocol)> GetActiveConnections()
-    {
-        var results = new List<(int, string, int, string)>();
-
-        try
-        {
-            // Use PowerShell to get detailed info (TCP and UDP)
-            var script = "Get-NetTCPConnection -State Established | Select-Object OwningProcess, RemoteAddress, RemotePort; " +
-                         "Get-NetUDPEndpoint | Select-Object OwningProcess, LocalAddress, LocalPort";
-                         
-            var psi = new ProcessStartInfo(_powershellPath, $"-NoProfile -ExecutionPolicy Bypass -Command \"{script}\"")
-            {
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            
-            var proc = Process.Start(psi);
-            var output = proc?.StandardOutput.ReadToEnd() ?? "";
-            proc?.WaitForExit();
-
-            foreach (var line in output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-            {
-                if (line.Contains("OwningProcess") || line.Contains("-------")) continue;
-                
-                var parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                if (parts.Length < 3) continue;
-
-                if (!int.TryParse(parts[0], out var pid)) continue;
-                var ip = parts[1];
-                if (!int.TryParse(parts[2], out var port)) continue;
-
-                // Simple heuristic to distinguish TCP/UDP output if piped together
-                // In actual execution, we might want to run them separately or add a Marker
-                string proto = "TCP"; 
-                if (ip == "0.0.0.0" || ip == "::") proto = "UDP";
-
-                results.Add((pid, ip, port, proto));
-            }
-        }
-        catch { }
-
-        return results;
     }
 
     private static Process? GetProcess(int pid)
     {
         if (pid <= 0) return null;
-        try
-        {
-            return Process.GetProcessById(pid);
-        }
-        catch
-        {
-            return null;
-        }
+        try { return Process.GetProcessById(pid); }
+        catch { return null; }
     }
 
     private string? GetPowerShellScript(int pid)
     {
         try
         {
-            var psi = new ProcessStartInfo(_powershellPath, $"-NoProfile -ExecutionPolicy Bypass -Command \"Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}' | Select-Object -ExpandProperty CommandLine\"")
+            var psi = new ProcessStartInfo(_powershellPath,
+                $"-NoProfile -ExecutionPolicy Bypass -Command \"Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}' | Select-Object -ExpandProperty CommandLine\"")
             {
                 RedirectStandardOutput = true,
                 UseShellExecute = false,
@@ -448,12 +471,11 @@ public class ProcessMonitor
             };
             var proc = Process.Start(psi);
             var output = proc?.StandardOutput.ReadToEnd() ?? "";
-            proc?.WaitForExit();
+            proc?.WaitForExit(3000);
 
-            // Looking for .ps1 or .psm1 in the command line
             if (output.Contains(".ps1", StringComparison.OrdinalIgnoreCase))
             {
-                var parts = output.Split(new[] { ' ', '\"', '\'' }, StringSplitOptions.RemoveEmptyEntries);
+                var parts = output.Split(new[] { ' ', '"', '\'' }, StringSplitOptions.RemoveEmptyEntries);
                 return parts.FirstOrDefault(p => p.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase)) ?? "UnknownScript";
             }
         }
@@ -531,4 +553,3 @@ public class IPNetwork2
         }
     }
 }
-
