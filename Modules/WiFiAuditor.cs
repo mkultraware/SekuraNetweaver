@@ -11,20 +11,20 @@ public class WifiAuditor
     {
         try
         {
-            // EnumerateAvailableNetworks gives us actual security info (auth + cipher).
-            // EnumerateBssNetworks only gives PhyType (802.11a/b/g/n/ac/ax) which is
-            // the radio standard, NOT the encryption standard. The two are unrelated.
-            var connectedNetworks = NativeWifi.EnumerateAvailableNetworks()
-                .Where(n => n.IsConnected)
-                .ToList();
-
-            if (connectedNetworks.Any())
+            // The cleanest way to get the active connection info in ManagedNativeWifi:
+            foreach (var interfaceInfo in NativeWifi.EnumerateInterfaces())
             {
-                var network = connectedNetworks.First();
-                var ssid = network.Ssid.ToString();
-                var secLabel = GetSecurityLabel(network.AuthAlgorithm, network.CipherAlgorithm);
-                var indicator = IsNetworkSafe(network.AuthAlgorithm, network.CipherAlgorithm) ? "✅" : "⚠️";
-                return $"{ssid} · {secLabel} {indicator}";
+                var (result, connectionInfo) = NativeWifi.GetCurrentConnection(interfaceInfo.Id);
+                if (result == ActionResult.Success && connectionInfo != null)
+                {
+                    var ssid = connectionInfo.Ssid.ToString();
+                    var auth = connectionInfo.AuthenticationAlgorithm;
+                    var cipher = connectionInfo.CipherAlgorithm;
+
+                    var secLabel = GetSecurityLabel(auth, cipher);
+                    var indicator = IsNetworkSafe(auth, cipher) ? "✅" : "⚠️";
+                    return $"{ssid} · {secLabel} {indicator}";
+                }
             }
 
             // Not on WiFi - fall back to NIC type
@@ -50,52 +50,46 @@ public class WifiAuditor
     /// <summary>
     /// Returns a human-readable security label derived from actual auth and cipher algorithms.
     /// </summary>
-    private static string GetSecurityLabel(AuthAlgorithm auth, CipherAlgorithm cipher)
+    private static string GetSecurityLabel(AuthenticationAlgorithm auth, CipherAlgorithm cipher)
     {
-        // Open network - no encryption
-        if (auth == AuthAlgorithm.Open && cipher == CipherAlgorithm.None)
+        string authStr = auth.ToString().ToUpperInvariant();
+        string cipherStr = cipher.ToString().ToUpperInvariant();
+
+        if (authStr.Contains("OPEN") && (cipherStr.Contains("NONE") || cipherStr == "0"))
             return "Open ⚠️";
 
-        // WEP - deprecated, broken
-        if (cipher is CipherAlgorithm.Wep40 or CipherAlgorithm.Wep104 or CipherAlgorithm.Wep)
+        if (authStr.Contains("WEP") || cipherStr.Contains("WEP"))
             return "WEP ⚠️";
 
-        // WPA3
-        if (auth is AuthAlgorithm.Wpa3Sae or AuthAlgorithm.Wpa3)
-            return "WPA3";
+        if (authStr.Contains("WPA3") || authStr.Contains("SAE") || authStr.Contains("OWE"))
+            return "WPA3/OWE";
 
-        // OWE (Opportunistic Wireless Encryption - open but encrypted)
-        if (auth == AuthAlgorithm.Owe)
-            return "OWE";
+        if (authStr.Contains("RSNA") || authStr.Contains("WPA2"))
+        {
+            return cipherStr.Contains("CCMP") || cipherStr.Contains("AES") ? "WPA2" : "WPA2 (weak cipher)";
+        }
 
-        // WPA2 - RSNA with CCMP/AES
-        if (auth is AuthAlgorithm.Rsna or AuthAlgorithm.RsnaPsk)
-            return cipher == CipherAlgorithm.Ccmp ? "WPA2" : "WPA2 (weak cipher)";
-
-        // WPA - legacy
-        if (auth is AuthAlgorithm.Wpa or AuthAlgorithm.WpaPsk)
+        if (authStr.Contains("WPA"))
             return "WPA ⚠️";
 
-        // Unknown or vendor-specific
-        return $"{auth}";
+        return authStr;
     }
 
     /// <summary>
     /// Returns true if the network uses a currently acceptable encryption standard.
     /// WEP, open, and legacy WPA are considered unsafe.
     /// </summary>
-    private static bool IsNetworkSafe(AuthAlgorithm auth, CipherAlgorithm cipher)
+    private static bool IsNetworkSafe(AuthenticationAlgorithm auth, CipherAlgorithm cipher)
     {
-        // Open with no encryption
-        if (auth == AuthAlgorithm.Open && cipher == CipherAlgorithm.None) return false;
+        string authStr = auth.ToString().ToUpperInvariant();
+        string cipherStr = cipher.ToString().ToUpperInvariant();
 
-        // WEP is cryptographically broken
-        if (cipher is CipherAlgorithm.Wep40 or CipherAlgorithm.Wep104 or CipherAlgorithm.Wep) return false;
+        // Unsafe: Open, WEP, or legacy WPA (TKIP)
+        if (authStr.Contains("OPEN") && cipherStr.Contains("NONE")) return false;
+        if (authStr.Contains("WEP") || cipherStr.Contains("WEP")) return false;
+        if (authStr.Contains("WPA") && !authStr.Contains("WPA2") && !authStr.Contains("WPA3") && !authStr.Contains("RSNA")) return false;
+        if (cipherStr.Contains("TKIP")) return false;
 
-        // WPA (TKIP) - deprecated, crackable
-        if (auth is AuthAlgorithm.Wpa or AuthAlgorithm.WpaPsk) return false;
-
-        // WPA2 or better with AES-CCMP or stronger = safe
         return true;
     }
 

@@ -351,18 +351,51 @@ public class ProcessMonitor
                         if (StaticWhitelist.Contains(name) || _dynamicWhitelist.Contains(name)) continue;
                     }
 
+                    // Trusted Paths: System-installed or Developer Extensions
+                    string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    bool isTrustedPath = !string.IsNullOrEmpty(fullPath) && (
+                        fullPath.StartsWith("C:\\Program Files\\", StringComparison.OrdinalIgnoreCase) ||
+                        fullPath.StartsWith("C:\\Program Files (x86)\\", StringComparison.OrdinalIgnoreCase) ||
+                        fullPath.Contains(".vscode\\extensions", StringComparison.OrdinalIgnoreCase)
+                    );
+
+                    if (isTrustedPath)
+                    {
+                        // SILENT TRUST: Admin or Dev installed software is implicitly safe.
+                        LogAlert($"TRUSTED [SAFE PATH]: {name} → {remoteIp}:{remotePort}");
+                        continue;
+                    }
+
                     // Reverse DNS with timeout - only done if process isn't already trusted
                     string hostName = GetHostName(remoteIp);
                     bool isSafeDomain = IsSafeDomain(hostName);
 
                     if (!isSuspiciousPath && isSafeDomain) continue;
 
-                    // Authenticode check - only for non-whitelisted, non-safe-domain connections
+                    // Signature Check - The core of the "Trust-All-Signed" model.
+                    // Reputable software (Mozilla, Google, Steam, etc.) is now implicitly trusted.
                     string publisher = GetPublisher(fullPath);
-                    bool isTrustedPublisher = !string.IsNullOrEmpty(publisher) &&
-                        TrustedPublishers.Any(p => publisher.Contains(p, StringComparison.OrdinalIgnoreCase));
+                    bool isSigned = !string.IsNullOrEmpty(publisher);
 
-                    if (!isSuspiciousPath && isTrustedPublisher) continue;
+                    if (isSigned)
+                    {
+                        if (!isSuspiciousPath)
+                        {
+                            // SILENT TRUST: Don't notify, but log it for forensics.
+                            LogAlert($"TRUSTED: {name} (Signed by: {publisher}) → {remoteIp}:{remotePort}");
+                            continue;
+                        }
+                        else
+                        {
+                            // SUSPICIOUS PATH ALERT: Even if signed, alert if running from Temp/Public.
+                            LogAlert($"ALERT [SUSPICIOUS PATH (SIGNED)]: {name} (Signed by: {publisher}) → {remoteIp}:{remotePort}");
+                        }
+                    }
+                    else
+                    {
+                        // UNSIGNED ALERT: No signature found. Always treat as suspicious.
+                        LogAlert($"ALERT [UNSIGNED]: {name} → {remoteIp}:{remotePort}");
+                    }
 
                     // PS script auditing - only when we're already going to alert
                     if (name == "powershell" || name == "pwsh")
