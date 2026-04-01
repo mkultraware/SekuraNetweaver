@@ -1,4 +1,5 @@
 # SekuraNetweaver (v1.4.3)
+[![VirusTotal Scan](https://img.shields.io/badge/VirusTotal-Clean-green)](https://www.virustotal.com/gui/file/d4a95a7d30849602931c2b09ebad7f1a9f52e6526669da19720e81a843e0b65c/detection)
 
 SekuraNetweaver is a lightweight, low-level network monitoring and security utility for Windows. It provides transparent visibility into processnd-to-network mappings, identifies suspicious connection patterns using advanced heuristics, and empowers users to manage their network privacy through an integrated, locale-independent DNS switcher.
 
