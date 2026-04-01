@@ -5,8 +5,8 @@
     <RootNamespace>SekuraNetweaver</RootNamespace>
     <OutputType>WinExe</OutputType>
 <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
-    <AssemblyVersion>1.4.2</AssemblyVersion>
-    <FileVersion>1.4.2</FileVersion>
+    <AssemblyVersion>1.4.3</AssemblyVersion>
+    <FileVersion>1.4.3</FileVersion>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <ImplicitUsings>enable</ImplicitUsings>

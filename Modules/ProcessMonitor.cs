@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Management;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
@@ -17,7 +18,7 @@ public class ProcessMonitor
 
     private Thread? _thread;
     private bool _running;
-    private readonly Dictionary<string, DateTime> _alerted = new();
+    private readonly ConcurrentDictionary<string, DateTime> _alerted = new();
     private DateTime _lastAlertedCleanup = DateTime.MinValue;
     private readonly ConcurrentDictionary<string, (string host, DateTime expiry)> _dnsCache = new();
     private DateTime _lastDnsCleanup = DateTime.MinValue;
@@ -27,7 +28,6 @@ public class ProcessMonitor
     // processes and keeps the hot path fast.
     private readonly ConcurrentDictionary<int, (string path, DateTime expiry)> _moduleCache = new();
 
-    private readonly string _powershellPath = "powershell.exe";
     private volatile bool _enabled = true;
 
     public bool Enabled
@@ -208,7 +208,7 @@ public class ProcessMonitor
         catch { }
     }
 
-    public static void AddToWhitelist(string processName, string ip = "")
+    public static void AddToWhitelist(string processName)
     {
         var updated = new HashSet<string>(_dynamicWhitelist, StringComparer.OrdinalIgnoreCase) { processName };
         _dynamicWhitelist = updated;
@@ -358,9 +358,9 @@ public class ProcessMonitor
                     // Trust pipeline — skip if in whitelists or has trusted publisher
                     if (StaticWhitelist.Contains(name) || _dynamicWhitelist.Contains(name)) continue;
 
-                    string pub = GetPublisher(fullPath);
-                    bool trustedPub = !string.IsNullOrEmpty(pub) &&
-                        TrustedPublishers.Any(p => pub.Contains(p, StringComparison.OrdinalIgnoreCase));
+                    string publisher = GetPublisher(fullPath);
+                    bool trustedPub = !string.IsNullOrEmpty(publisher) &&
+                        TrustedPublishers.Any(p => publisher.Contains(p, StringComparison.OrdinalIgnoreCase));
 
                     bool isAuditOnly = false;
                     if (trustedPub && !isSuspiciousPath)
@@ -378,6 +378,11 @@ public class ProcessMonitor
                     // PTR lookup — display context only, NOT a trust gate.
                     string hostName = GetHostName(remoteIp);
 
+                    // Domain/IP whitelist check — user-trusted destinations are skipped silently.
+                    if (_dynamicSafeDomains.Contains(remoteIp) ||
+                        (!string.IsNullOrEmpty(hostName) && _dynamicSafeDomains.Contains(hostName)))
+                        continue;
+
                     // Deduplication: same process+IP+port suppressed for 5 minutes.
                     // This covers ALL connections reaching this point — trusted or not —
                     // so persistent connections don't spam the log.
@@ -388,7 +393,6 @@ public class ProcessMonitor
 
                     _alerted[alertKey] = DateTime.Now;
 
-                    string publisher = GetPublisher(fullPath);
                     var tags = new System.Text.StringBuilder();
                     if (isSuspiciousPath) tags.Append(" [SUSPICIOUS PATH]");
                     if (isLolBin)         tags.Append(" [LOLBIN]");
@@ -421,7 +425,7 @@ public class ProcessMonitor
                 {
                     var cutoff = now.AddHours(-1);
                     foreach (var k in _alerted.Where(kvp => kvp.Value < cutoff).Select(kvp => kvp.Key).ToList())
-                        _alerted.Remove(k);
+                        _alerted.TryRemove(k, out _);
                     _lastAlertedCleanup = now;
                 }
 
@@ -472,25 +476,20 @@ public class ProcessMonitor
         catch { return null; }
     }
 
-    private string? GetPowerShellScript(int pid)
+    private static string? GetPowerShellScript(int pid)
     {
         try
         {
-            var psi = new ProcessStartInfo(_powershellPath,
-                $"-NoProfile -ExecutionPolicy Bypass -Command \"Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}' | Select-Object -ExpandProperty CommandLine\"")
+            using var searcher = new ManagementObjectSearcher(
+                $"SELECT CommandLine FROM Win32_Process WHERE ProcessId = {pid}");
+            foreach (ManagementObject obj in searcher.Get())
             {
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            var proc = Process.Start(psi);
-            var output = proc?.StandardOutput.ReadToEnd() ?? "";
-            proc?.WaitForExit(3000);
-
-            if (output.Contains(".ps1", StringComparison.OrdinalIgnoreCase))
-            {
-                var parts = output.Split(new[] { ' ', '"', '\'' }, StringSplitOptions.RemoveEmptyEntries);
-                return parts.FirstOrDefault(p => p.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase)) ?? "UnknownScript";
+                var output = obj["CommandLine"]?.ToString() ?? "";
+                if (output.Contains(".ps1", StringComparison.OrdinalIgnoreCase))
+                {
+                    var parts = output.Split(new[] { ' ', '"', '\'' }, StringSplitOptions.RemoveEmptyEntries);
+                    return parts.FirstOrDefault(p => p.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase)) ?? "UnknownScript";
+                }
             }
         }
         catch { }
